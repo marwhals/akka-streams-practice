@@ -1,12 +1,13 @@
 package part5_advanced
 
 import akka.actor.ActorSystem
-import akka.stream.scaladsl.{Sink, Source}
-import akka.stream.{ActorMaterializer, Attributes, Inlet, Outlet, SinkShape, SourceShape}
-import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
+import akka.stream._
+import akka.stream.scaladsl.{Flow, Keep, Sink, Source}
+import akka.stream.stage.{GraphStage, GraphStageLogic, GraphStageWithMaterializedValue, InHandler, OutHandler}
 
 import scala.collection.mutable
-import scala.util.Random
+import scala.concurrent.{Future, Promise}
+import scala.util.{Failure, Random, Success}
 
 /**
  * Input port methods
@@ -42,7 +43,7 @@ object CustomOperators extends App {
   implicit val materializer = ActorMaterializer()
 
   // 1 - a customer source which emits random numbers until canceled
-  class RandomNumberGenerator(max: Int) extends GraphStage[/*step 0: define the shape */ SourceShape[Int]] {
+  class RandomNumberGenerator(max: Int) extends GraphStage[ /*step 0: define the shape */ SourceShape[Int]] {
 
     // step 1: define the ports and the component-specific members
     val outPort = Outlet[Int]("randomGenerator")
@@ -71,17 +72,20 @@ object CustomOperators extends App {
   }
 
   val randomGeneratorSource = Source.fromGraph(new RandomNumberGenerator(100))
-//  randomGeneratorSource.runWith(Sink.foreach(println))
+  //  randomGeneratorSource.runWith(Sink.foreach(println))
 
   // 2 - a custom sink that prints elements in batches of a given size
 
   class Batcher(batchSize: Int) extends GraphStage[SinkShape[Int]] {
     val inPort = Inlet[Int]("batcher")
+
     override def shape: SinkShape[Int] = SinkShape[Int](inPort)
+
     override def createLogic(inheritedAttributed: Attributes): GraphStageLogic = new GraphStageLogic(shape) {
       override def preStart(): Unit = {
         pull(inPort)
       }
+
       // mutable state
       val batch = new mutable.Queue[Int]
 
@@ -94,16 +98,17 @@ object CustomOperators extends App {
           // assume some complex
           Thread.sleep(100)
 
-          if(batch.size >= batchSize) {
-            println("New batch: " + batch.dequeueAll(_ => true).mkString("[",", ", "]"))
+          if (batch.size >= batchSize) {
+            println("New batch: " + batch.dequeueAll(_ => true).mkString("[", ", ", "]"))
           }
 
 
           pull(inPort) // send demand upstream
         }
+
         override def onUpstreamFinish(): Unit = {
           if (batch.nonEmpty) {
-            println("New batch: " + batch.dequeueAll(_ => true).mkString("[",", ", "]"))
+            println("New batch: " + batch.dequeueAll(_ => true).mkString("[", ", ", "]"))
             println("Stream finished.")
           }
         }
@@ -113,5 +118,119 @@ object CustomOperators extends App {
 
   val batcherSink = Sink.fromGraph(new Batcher(10))
   randomGeneratorSource.to(batcherSink).run()
+
+  /**
+   * Exercise: A custom flow - a simple filter flow
+   *
+   */
+  class SimpleFilter[T](predicate: T => Boolean) extends GraphStage[FlowShape[T, T]] {
+
+    val inPort = Inlet[T]("filterIn")
+    val outPort = Outlet[T]("filterOut")
+
+    override def shape: FlowShape[T, T] = FlowShape(inPort, outPort)
+
+    override def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) {
+      setHandler(outPort, new OutHandler {
+        override def onPull(): Unit = pull(inPort)
+      })
+
+      setHandler(inPort, new InHandler {
+        override def onPush(): Unit = {
+          try {
+            val nextElement = grab(inPort)
+
+            if (predicate(nextElement)) {
+              push(outPort, nextElement) // pass it on
+            } else {
+              pull(inPort) // ask for another element
+            }
+          } catch {
+            case e: Throwable => failStage(e)
+          }
+        }
+      })
+    }
+  }
+
+  val myFilter = Flow.fromGraph(new SimpleFilter[Int](_ > 5))
+//  randomGeneratorSource.via(myFilter).to(batcherSink).run()
+
+  // 3 - a flow that counts the number of elements that go though it
+  class CounterFlow[T] extends GraphStageWithMaterializedValue[FlowShape[T, T], Future[Int]] {
+
+    val inPort = Inlet[T]("counterInt")
+    val outPort = Outlet[T]("counterOut")
+
+    override val shape = FlowShape(inPort, outPort)
+
+    override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[Int]) = {
+      val promise = Promise[Int]
+      val logic = new GraphStageLogic(shape) {
+        // setting mutable state
+        var counter = 0
+
+        setHandler(outPort, new OutHandler {
+          override def onPull(): Unit = pull(inPort)
+
+          override def onDownstreamFinish(): Unit = {
+            promise.success(counter)
+            super.onDownstreamFinish()
+          }
+        })
+
+        setHandler(inPort, new InHandler {
+          override def onPush(): Unit = {
+            // extract the element
+            val nextElement = grab(inPort)
+            counter += 1
+            // pass it on
+            push(outPort, nextElement)
+          }
+
+          override def onUpstreamFinish(): Unit = {
+            promise.success(counter)
+            super.onUpstreamFinish()
+          }
+
+          override def onUpstreamFailure(ex: Throwable): Unit = {
+            promise.failure(ex)
+            super.onUpstreamFailure(ex)
+          }
+        })
+      }
+      (logic, promise.future)
+    }
+  }
+
+  val counterFlow = Flow.fromGraph(new CounterFlow[Int])
+  val countFuture = Source(1 to 10)
+//    .map(x => if (x == 7) throw new RuntimeException("gotcha") else x)
+    .viaMat(counterFlow)(Keep.right)
+    .to(Sink.foreach(x => if (x == 7) throw new RuntimeException("gotcha, sink!") else println(x)))
+//    .to(Sink.foreach[Int](println))
+    .run()
+
+  import system.dispatcher
+  countFuture.onComplete {
+    case Success(count) => println(s"The number of elements passed: $count")
+    case Failure(ex) => println(s"Counting the elements failed: $ex")
+
+  }
+
+  /**
+   * Notes: Graph Stage API
+   * - Define a component class that extends GraphStage typed with the shape that we wanted
+   * - Or extends GraphStage with materialized value type with the shape and the type of the materialized value that we wanted
+   * -- then write the component specific members
+   * -- then the critical method that needs to be implemented was create Logic
+   * --- Any mutable stage goes inside that object
+   * --- Then set handlers for inputs and
+   * --- Then override the appropriate callbacks on push for inputs and onPull for outputs
+   * --- And inside we define our Logic filtering
+   *
+   * Handler callbacks are never called concurrently ---> so you can safely access mutable state inside these handlers
+   * ---- Never!! expose mutable state outside these handlers!
+   */
 
 }
